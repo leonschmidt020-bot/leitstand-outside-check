@@ -1,0 +1,66 @@
+# Outside check for the Leitstand (plan v2.6 "Outside check"). Mirrored by Joel's Claude into its
+# own public repo as .github/workflows/outside-check.yml; see README.md next to this file.
+# Every 10 minutes: is the Leitstand reachable from outside, and each target? Each result goes
+# to the Leitstand's report-only endpoint with a key that can do nothing else. If the Leitstand
+# itself is unreachable the run fails, so GitHub e-mails Joel.
+# It reveals nothing: addresses, target names and the key come only from secrets; the log shows
+# only "self", "target <n>" and "report <n>" with ok / not ok / sent / failed. No checkout, no
+# actions, no tokens (permissions: {}), no push keys. Guard: tools/guards (outside-check-quiet).
+name: outside-check
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Report target 1 as not ok once (staged outage for the proof)'
+        type: boolean
+        default: false
+permissions: {}
+concurrency:
+  group: outside-check
+  cancel-in-progress: false
+jobs:
+  check:
+    # arm64 like everything else (AGENTS.md); free for public repos.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: check
+        env:
+          LEITSTAND_URL: ${{ secrets.LEITSTAND_URL }}
+          LEITSTAND_REPORT_KEY: ${{ secrets.LEITSTAND_REPORT_KEY }}
+          TARGETS: ${{ secrets.TARGETS }}
+          STAGE: ${{ inputs.stage == true }}
+        run: |
+          set -uo pipefail
+          set +x
+          # TARGETS: one "<id> <url>" per line; id is the Leitstand product id.
+          probe() { curl -s -o /dev/null -w '%{http_code}' --max-time 15 --proto '=https' "$1" 2>/dev/null || true; }
+          healthy() { [[ "$1" =~ ^[23][0-9][0-9]$ ]]; }
+          if ! healthy "$(probe "$LEITSTAND_URL/healthz")"; then
+            echo "self: not ok"
+            exit 1
+          fi
+          echo "self: ok"
+          failed=0
+          i=0
+          while read -r id url; do
+            [ -z "${id:-}" ] && continue
+            i=$((i + 1))
+            echo "::add-mask::$id"
+            echo "::add-mask::$url"
+            if ! [[ "$id" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]]; then
+              echo "target $i: bad id"
+              failed=1
+              continue
+            fi
+            ok=false
+            healthy "$(probe "$url")" && ok=true
+            [ "$STAGE" = "true" ] && [ "$i" -eq 1 ] && ok=false
+            if [ "$ok" = "true" ]; then echo "target $i: ok"; else echo "target $i: not ok"; fi
+            code="$(printf 'header = "Authorization: Bearer %s"\ndata = "{\\"target\\":\\"%s\\",\\"ok\\":%s}"\n' "$LEITSTAND_REPORT_KEY" "$id" "$ok" \
+              | curl -s -o /dev/null -w '%{http_code}' --max-time 15 --proto '=https' -X POST --config - "$LEITSTAND_URL/report/outside" 2>/dev/null || true)"
+            if [ "$code" = "200" ]; then echo "report $i: sent"; else echo "report $i: failed"; failed=1; fi
+          done <<< "$TARGETS"
+          exit "$failed"
